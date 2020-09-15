@@ -1,0 +1,42 @@
+gcc -m64 -Wall \
+    -I../INCLUDE \
+    -c \
+    -g \
+    gerais.c \
+&& \
+proc \
+COMMON_PARSER=YES \
+INCLUDE=../INCLUDE \
+INCLUDE=../../BIBLIOTECAS/BANCO/INCLUDE \
+INCLUDE=../../BIBLIOTECAS/HASHTABLE/INCLUDE \
+PARSE=FULL \
+SQLCHECK=SYNTAX \
+ORACA=YES \
+MODE=ORACLE \
+DBMS=V8 \
+LINES=YES \
+CODE=ANSI_C \
+THREADS=NO \
+DEF_SQLCODE=yes \
+PREFETCH=65535 \
+UNSAFE_NULL=yes $1 \
+SYS_INCLUDE=/usr/include \
+SYS_INCLUDE=/usr/include/sys \
+INCLUDE=/1d/app/oracle/product/12.1.0/client_1/precomp/public \
+INCLUDE=/1d/app/oracle/product/12.1.0/client_1/rdbms/demo \
+INCLUDE=/1d/app/oracle/product/12.1.0/client_1/lib \
+&& \
+gcc -pthread -Wall -D_LARGEFILE64_SOURCE -g -lz \
+-L $ORACLE_HOME/lib -l clntsh \
+-I../INCLUDE \
+-I/1d/app/oracle/product/12.1.0/client_1/precomp/public \
+-I/1d/app/oracle/product/12.1.0/client_1/precomp/public \
+-I/1d/app/oracle/product/12.1.0/client_1/rdbms/demo \
+-I/1d/app/oracle/product/12.1.0/client_1/lib \
+-I../../BIBLIOTECAS/BANCO/INCLUDE \
+-I../../BIBLIOTECAS/HASHTABLE/INCLUDE \
+${1%%.pc}.c \
+gerais.o \
+../../BIBLIOTECAS/BANCO/SRC/cob-banco.o \
+../../BIBLIOTECAS/HASHTABLE/SRC/genericHashTable.o \
+-o ${1%%.pc}

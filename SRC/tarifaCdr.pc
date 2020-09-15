@@ -1,0 +1,1649 @@
+/* -----------------------------------------------------------------
+ *       (c) COPYRIGHT 2012 - CLEARTECH
+
+ *       ALL RIGHTS RESERVED - TODOS OS DIREITOS RESERVADOS
+ *       CONFIDENTIAL, UNPUBLISHED PROPERTY OF CLEARTECH
+ *       PROPRIEDADE CONFIDENCIAL NAO PUBLICADA DA CLEARTECH Ltda.
+
+ *       A CLEARTECH nao se responsabiliza pelo uso indevido de seu codigo.
+-------------------------------------------------------------------- */
+/*********************************************************************
+                                ---     Sistema Tarifação Cobilling ---
+                                  Calcula o valor liquido da cdr.
+     $Author: Luciano Soares Mariote / Fabio Reis
+     $Data:       27/08/2012 16:15:00 PM
+ *********************************************************************/
+
+#define VERSAO "2.0.0 - 09/07/2018"
+
+
+/*
+QUEM?               QUANDO?            VERSAO?         O QUE?
+*************************************************************************************************************************
+Tiago Gennari       18/07/2016         1.0.0           * Início do versionamento do tarifaCdr
+                                                       * Passa a sair do programa se não encontrar a tarifa no banco para cambridge
+ */
+
+ 
+#include <tarifaCdr.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <sched.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <wchar.h>
+#include <sys/wait.h>
+#include <sqlca.h>
+#include <oraca.h>
+
+#define QTDE_MAX_THREADS_DEFAULT 35
+
+EXEC SQL BEGIN DECLARE SECTION;
+  char dbNomeBanco[100];
+EXEC SQL END DECLARE SECTION;
+
+char auxNumThread[50];
+char qntdeThread[BUFSIZ];
+
+// Agora todos os logs passam a ter mais de um
+char dirLogF[BUFSIZ];
+char dirPrincipal[BUFSIZ];
+long long seqRemessaVal[6999999];
+long long seqRemessaDurTar[6999999];
+
+char listaEmail[1024];
+char bancoxx[200];
+char dbDirEtc[100 + 1];
+
+int listaBanco = 0;
+
+int QTDE_MAX_THREADS, fp_log_filho_erro;
+FILE *fdirThread;
+
+// Variaveis utilizadas na Thread
+int flagThread[99];
+long qtdeFinal = 0;
+long qtdeThreadsTerminadas = 0;
+char dataC[11 + 1];
+char horaC[8 + 1];
+char DATABASE[BUFSIZ];
+
+pthread_mutex_t MutexThread;
+pthread_mutex_t MutexVariavel;
+pthread_mutex_t MutexBD;
+
+hashtable_t *hashEmpresa = NULL;
+
+// ****************************** FUNCTION MAIN **********************************
+// *******************************************************************************
+
+int main (int argc, char **argv)
+{
+	int fp_numThread = 0;
+
+	char strRascunho[1024];
+	char email[BUFSIZ];
+
+	// Inicializa as variaveis ...
+	memset(auxNumThread,0,sizeof(auxNumThread));
+	memset(qntdeThread,0,sizeof(qntdeThread));
+	memset(dirPrincipal,0,sizeof(dirPrincipal));
+	memset (seqRemessaVal,0,sizeof(seqRemessaVal));
+  memset (seqRemessaDurTar,0,sizeof(seqRemessaDurTar));
+  
+  
+
+	printf("PROGRAMA DE TARIFACAO INICIALIZADO COM SUCESSO !!!\n");
+	printf("Versao [%s]\n\n", VERSAO);
+	fflush(stdout);
+
+	// inicializa os Mutex...
+	inicializaMutex(MutexThread);
+	inicializaMutex(MutexVariavel);
+	inicializaMutex(MutexBD);
+
+	// Lendo argumentos de entrada
+	if(argc != 3)
+	{
+		fprintf(stderr, "Sintaxe : %s \n"
+				"1. <Banco a ser conectado.>\n"
+				"2. <Diretorio raiz de Log.>\n",argv[0]);
+		exit(1);
+	}
+
+	// recebendo os parametros ...
+	strcpy(DATABASE,argv[1]);
+	strcpy(dirLogF,argv[2]);
+	dirName(dirPrincipal,dirLogF);
+
+
+  if(strstr(dirLogF, "/1d/cobilling/c65") != NULL)
+	{
+		nTipoEmpresa = TLC;
+	}
+	else if(strstr(dirLogF, "/1d/cobilling/c75") != NULL)
+	{
+		nTipoEmpresa = VIP;
+	}	
+	else
+	{
+		printf("Erro ao determinar a empresa de execução: c65 ou c75.");
+		exit(1);
+	}
+
+
+	// Conecta no Banco ...
+	logInDatabase(DATABASE);
+
+	// busca lista para emails ...
+	buscaListaEmail();
+	buscaDiretorioExecucao();
+
+	// Carrega em memoria a tabela t_empresa
+	carregaEmpresa();
+
+
+	// recebe a data e a hora corrente para as threads utilizarem ...
+	hoje(dataC);
+	agora(horaC);
+
+	// Le arquivo com o numero de threads
+	sprintf(qntdeThread,"%s/tarifaCdr.npf",dbDirEtc);
+	if((fdirThread=fopen(qntdeThread,"r"))==NULL)
+	{
+		printf("\n- Arquivo com o numero de Threads nao encontrado. Valor default: 10 threads.\n");
+		// Cria o arquivo com o numero default de Threads ...
+		if ((fp_numThread = open(qntdeThread, O_WRONLY|O_TRUNC|O_CREAT|O_SYNC, 0666)) < 0)
+		{
+			printf("Erro  na criacao do arquivo %s/tarifaCdr.npf\n",dbDirEtc);
+			exit(1);
+		}
+		write(fp_numThread,"10\n",3);
+		close(fp_numThread);
+		QTDE_MAX_THREADS=QTDE_MAX_THREADS_DEFAULT;
+	}
+	else
+	{
+		fgets(auxNumThread, 10, fdirThread);
+		QTDE_MAX_THREADS=atoi(auxNumThread);
+		// maximo de 95 threads
+		if(QTDE_MAX_THREADS==1)
+			QTDE_MAX_THREADS=2;
+		if(QTDE_MAX_THREADS>95)
+		{
+			printf("\n Assumindo o valor maximo de Threads permitido: 95.\n");
+			QTDE_MAX_THREADS=95;
+		}
+		fclose(fdirThread);
+	}
+
+
+	printf("\n\n *************************************************************\n");
+	printf("\n Verificando condicoes para inicializar as quebras ...\n");
+	if(ValidaProgramas())
+	{
+		// Finaliza o programa pois tem algum outro sendo executado que o impede de rodar ...
+		printf("\n PROGRAMA FINALIZADO COM ERRO na FUNCAO QUE VALIDA A EXECUCAO ...\n");
+
+		// envia um email avisando ...
+		sprintf(email,"echo \"PROGRAMA FINALIZADO COM ERRO NA FUNCAO QUE VALIDA A EXECUCAO - %s. \"| mailx -s \"TARIFACAO CDR - PROGRAMA FINALIZADO COM ERRO - %s .\" %s",DATABASE,DATABASE,listaEmail);
+
+		system(email);
+		exit(1);
+	}
+
+
+	// Obtendo o diretorio de entrada ...
+	sprintf(g_cEntrada,"%s/quebra/E/ARQ", dirPrincipal);
+
+	// criando os diretorios ...
+	sprintf(g_cTemp,"%s/tarifa_cdr/E/temporario", dirPrincipal);
+
+	sprintf(strRascunho,"mkdir -p %s %s/tarifa_cdr/E ", g_cTemp, dirLogF);
+	system(strRascunho);
+
+	printf("\n\n *************************************************************\n");
+	printf("\n Tarifando as cdrs ...\n\n");
+
+	// Desconecta no banco de dados
+	//logOutDatabase("connTarCdr");
+
+
+	// Funcao para criar as threads ...
+	criaThread();
+
+	// Conecta no banco de dados
+	logInDatabase(bancoxx);
+	
+
+	// atualiza a tabela t_conv_carga com os valores calculados
+	if(atualizaConvCarga())
+	{
+		// Finaliza o programa pois tem algum outro sendo executado que o impede de rodar ...
+		printf("\n PROGRAMA FINALIZADO COM ERRO na FUNCAO QUE ATUALIZA A TABELA T_CONV_CARGA ...\n");
+
+		// envia um email avisando ...
+		sprintf(email,"echo \"PROGRAMA FINALIZADO COM ERRO NA FUNCAO QUE ATUALIZA A TABELA T_CONV_CARGA - %s. \"| mailx -s \"TARIFACAO CDR - PROGRAMA FINALIZADO COM ERRO - %s .\" %s",DATABASE,DATABASE,listaEmail);
+
+		system(email);
+		exit(1);
+	}
+
+
+	// funcao responsavel por atualizar o semaforo ...
+	finalizaSemaforo();
+
+  close(fp_log_filho_erro);
+
+
+  //Destroi o Mutex e finaliza a thread
+  destroiMutex(MutexThread);
+  destroiMutex(MutexVariavel);
+  destroiMutex(MutexBD);
+  printf("\n\n\n PROGRAMA FINALIZADO COM SUCESSO !!!\n\n");
+  exit(0);
+}
+
+int carregaEmpresa()
+{
+
+  int tam;
+
+  char cEotEmp[10 + 1];
+  char cTipoEmp[10 + 1];
+  char db_cComando[1024 + 1];
+  char sigla_holding[3 + 1];
+ 
+  hashEmpresa = ht_create(5000);
+  hashEmpresa_t *itemHashEmpresa = NULL;
+
+  // Comando select ...
+  sprintf(db_cComando, "SELECT cod_eotemp, tip_empresa, sigla_holding FROM t_empresa where REGEXP_LIKE(cod_eotemp , '[A-Z0-9]{3}')");
+
+  EXEC SQL PREPARE pEots FROM :db_cComando;
+  if (escreveSQLErro(sqlca, "ERRO NO PREPARE DA TABELA t_empresa.") == 0)
+    return 1;
+
+  EXEC SQL DECLARE pLinhasEots CURSOR FOR pEots;
+  if (escreveSQLErro(sqlca, "ERRO NO DECLARE DA TABELA t_empresa.") == 0)
+    return 1;
+
+  EXEC SQL OPEN pLinhasEots;
+  if (escreveSQLErro(sqlca, "ERRO NO OPEN DA TABELA t_empresa.") == 0)
+    return 1;
+
+  while (1)
+  {
+    EXEC SQL FETCH pLinhasEots INTO :cEotEmp, :cTipoEmp, :sigla_holding;
+    if (escreveSQLErro(sqlca, "Erro ao executar o Fech na tabela t_empresa.") == 0)
+      return 1;
+
+    if (SQLCODE != 0)
+      break;
+
+    // valida se o campo cEotEmp tem apenas 3 bytes.
+    rtrim(cEotEmp);
+    tam = strlen(cEotEmp);
+    if (tam != 3)
+    {
+      printf("Erro. eot cadastrada na tabela t_empresa diferente de 3 bytes. <%s>\n", cEotEmp);
+      return 1;
+    } 
+
+    // valida se o campo cTipoEmp tem apenas 1 byte.
+    rtrim(cTipoEmp);
+    tam = strlen(cTipoEmp);
+    if (tam != 1)
+    {
+      printf("Erro. eot cadastrada na tabela t_empresa diferente de 1 byte. <%s>\n", cTipoEmp);
+      return 1;
+    }
+
+    itemHashEmpresa = (hashEmpresa_t*)malloc(sizeof(hashEmpresa_t));
+    memset(itemHashEmpresa, 0, sizeof(itemHashEmpresa));
+
+    sprintf(itemHashEmpresa->cCodEot, "%3.3s", cEotEmp);
+    sprintf(itemHashEmpresa->cTipoEmp, "%1.1s", cTipoEmp);
+    sprintf(itemHashEmpresa->sigla_holding, "%3.3s", sigla_holding);
+
+    ht_put(hashEmpresa, cEotEmp, itemHashEmpresa);
+  }
+
+  return 0;
+}
+
+// ---Funcao principal do processo de sumarizacao ---
+void criaThread()
+{
+  pthread_t threads[99];
+
+  DIR* dirAberto = NULL;
+  struct dirent *leDiretorio = NULL;
+
+  char parametro[TAM_MAX_BUFFER + 1];
+  char dataLog[8 + 1];
+  char horaLog[6 + 1];
+  char strRascunho[TAM_MAX_BUFFER + 1];
+  char message[TAM_MAX_BUFFER + 1];
+
+  int auxQtdeThreads = 0;
+  int fp_log_pai_ok = 0;
+  int qtdeThreads = 0;
+  int resThread = 0;
+  int i = 0;
+  int j = 0;
+
+  for (i = 0; i < 99; i++)
+    flagThread[i] = 0;
+
+  // Data que ira para o log ...
+  hoje1(dataLog);
+  agora1(horaLog);
+
+  // Cria o LogPaiSum e o   e a lista que ira alimentar o programa do dbLoad ...
+  sprintf(strRascunho, "%s/tarifa_cdr/E/LogTarifaCdrEnvioOk.D%sH%s", dirLogF, dataLog, horaLog);
+  if ((fp_log_pai_ok = open(strRascunho, O_WRONLY | O_TRUNC | O_CREAT | O_SYNC, 0666)) < 0)
+  {
+    printf("Erro 2 na criacao/abertura do arquivo %s", strRascunho);
+    exit(1);
+  }
+
+  // Cria o arquivo de LogFilhoErroSum
+  sprintf(strRascunho, "%s/tarifa_cdr/E/LogTarifaCdrEnvioErro.D%sH%s", dirLogF, dataLog, horaLog);
+  if ((fp_log_filho_erro = open(strRascunho, O_WRONLY | O_TRUNC | O_CREAT | O_SYNC, 0666)) < 0)
+  {
+    printf("Erro 3 na criacao/abertura do arquivo <%s>\n", strRascunho);
+    exit(1);
+  }
+
+  // Abre diretorio ---
+  if ((dirAberto = opendir(g_cEntrada)) == NULL)
+  {
+    printf("Erro ao abrir o diretorio de entrada: <%s>\n", g_cEntrada);
+    sprintf(strRascunho, "Erro ao abrir o diretorio de entrada: <%s>\n", g_cEntrada);
+    gravaSoLog(fp_log_filho_erro, strRascunho);
+    exit(1);
+  }
+
+  while ((leDiretorio = readdir(dirAberto)) != NULL)
+  {
+    // Trocar depois pela mascara correta ...
+    if (strstr(leDiretorio->d_name, "sem_tarifa.quebraEnvio") == NULL)
+      continue;
+
+    // Bloqueia o mutex e cria a thread.
+    pthread_mutex_lock(&MutexThread);
+
+    for (i = 0; i < QTDE_MAX_THREADS; i++)
+      if (flagThread[i] == 0)
+        break;
+
+    sprintf(parametro, "%s|%d", leDiretorio->d_name, i);
+    resThread = pthread_create(&threads[i], NULL, processaArquivo, (void *)parametro);
+    if (resThread)
+    {
+      printf("\n Erro 5 ao criar a Thread.  Causa: %s\n", strerror(errno));
+      sprintf(strRascunho, "%s|ERRO_CRIA_THREAD",  leDiretorio->d_name);
+      gravaSoLog(fp_log_filho_erro, strRascunho);
+      pthread_mutex_unlock(&MutexThread);
+    }
+    else
+    {
+      pthread_detach(threads[i]);
+      qtdeThreads++;
+      qtdeFinal++;
+      i++;
+    }
+
+    // Logica para incrementar/decrementar o numero de thread
+    auxQtdeThreads = qtdeThreads + 1;
+    while (qtdeThreads >= QTDE_MAX_THREADS)
+    {
+      i = 0;
+      while (flagThread[i] != 2)
+      {
+        i++;
+        if (i == auxQtdeThreads)
+          i = 0;
+      }
+
+      qtdeThreads--;
+      flagThread[i] = 0;
+    }
+
+    // Grava no log os arquivos que estao sendo processados
+    sprintf(message, "%s - ENV_PROC", leDiretorio->d_name);
+    gravaSoLog(fp_log_pai_ok, message);
+
+    // Le arquivo com o numero de threads
+    if ((fdirThread = fopen(qntdeThread, "r")) == NULL)
+      continue;
+    else
+    {
+      fgets(auxNumThread, 3, fdirThread);
+      QTDE_MAX_THREADS = atoi(auxNumThread);
+      if (QTDE_MAX_THREADS > 95)
+        QTDE_MAX_THREADS = 95;
+      fclose(fdirThread);
+    }
+    j++;
+  }// Fim Logica Thread
+
+  // Espera termino das ultimas Threads
+  while (qtdeFinal != qtdeThreadsTerminadas)
+  {
+    i = 0;
+    sleep(2);
+  }
+
+  // fecha os arquivos de Log ...
+  close(fp_log_pai_ok);
+}
+
+// Funcao Processa Arquivo - recebe o arquivo ...
+void *processaArquivo(void *paramThread)
+{
+	FILE *fp_arquivoEntrada = NULL;
+	FILE *fp_arquivoSaida   = NULL;
+	CAMPOS_STR vetCampos;
+
+	int indice  = 0;
+	int written = 0;
+
+	char cPathEntrada[1024+1];
+	char cStrRascunho[1024+1];
+	char cNomeRemessa[600+1];
+	char cNomeSaida[600+1];
+	char cPathSaida[1024+1];
+	char cBuffer[600+1];
+	char cResultado[11+1];
+	char assB[23+1];
+	char cNomeOrig[35+1];
+	char datCham[8+1];
+
+	// Campos layout ...
+	char cEotO[3+1];
+	char cEotD[3+1];
+	char cGh[1+1];
+	//char cn_b_ddd[2+1];
+
+	char cDataChamada[10+1];
+	char cDuracaoTarifada[6+1];
+	char cAuxDuracaoTarifada[7+1];
+  char cAuxDurTar[7+1];
+	char cValorLiquido[10+1];
+	char cValorTarifa[16+1];
+	char durReal[7+1];
+	char auxDur[7+1];
+	//char cnAssa[2+1];
+	//char codNatureza[3+1];
+	char seq[7+1];
+	char degrau[2+1];
+  //char tpDestino[10+1];
+  hashEmpresa_t *itemHashEmpresa = NULL;
+
+
+	// Inicializa as variaveis ...
+	memset(cPathEntrada, 0, sizeof(cPathEntrada));
+	memset(cStrRascunho, 0, sizeof(cStrRascunho));
+	memset(cNomeRemessa, 0, sizeof(cNomeRemessa));
+	memset(cPathSaida, 0, sizeof(cPathSaida));
+	memset(cDataChamada, 0, sizeof(cDataChamada));
+	memset(cDuracaoTarifada, 0, sizeof(cDuracaoTarifada));
+	memset(cValorLiquido, 0, sizeof(cValorLiquido));
+	memset(cBuffer, 0, sizeof(cBuffer));
+  memset(cAuxDurTar, 0, sizeof(cAuxDurTar));
+
+  
+  
+	// Recebe os paramentros ...
+	strcpy(cStrRascunho, paramThread);
+	separaCampos(cStrRascunho, '|', &vetCampos,2);
+
+	// Copia os parametros para as variaveis ...
+	strcpy(cNomeRemessa, vetCampos.campo[0]);
+	indice = atoi(vetCampos.campo[1]);
+
+	//seta flag para thread rodando e desbloqueia a Thread ...
+	flagThread[indice] = 1;
+	pthread_mutex_unlock(&MutexThread);
+
+	system(" ");
+
+	sprintf(cPathEntrada,"%s/%s", g_cEntrada, cNomeRemessa);
+	if((fp_arquivoEntrada = fopen64(cPathEntrada, "r")) == NULL)
+	{
+
+		sprintf(cStrRascunho, "Erro ao abrir o arquivo <%s>\n", cPathEntrada);
+		gravaSoLog(fp_log_filho_erro, cStrRascunho);
+		exit(1);
+	}
+
+	sprintf(cNomeSaida,"%32.32s", cNomeRemessa+11);
+	sprintf(cPathSaida,"%s/%s.tarifa", g_cTemp, cNomeSaida);
+	if((fp_arquivoSaida = fopen64(cPathSaida, "w")) == NULL)
+	{
+
+		sprintf(cStrRascunho, "Erro ao criat o arquivo <%s>\n", cPathSaida);
+		gravaSoLog(fp_log_filho_erro, cStrRascunho);
+		exit(1);
+	}
+
+	while(fgets(cBuffer, 600, fp_arquivoEntrada) != NULL)
+	{
+		memset(cValorTarifa, 0, sizeof(cValorTarifa));
+		sprintf(cDataChamada,"%4.4s-%2.2s-%2.2s", cBuffer+74, cBuffer+72, cBuffer+70);
+		sprintf(cValorLiquido,"%10.10s", cBuffer+352);
+		sprintf(assB,"%23.23s", cBuffer+42);
+		sprintf(seq,"%7.7s",cBuffer+504);
+
+		sprintf(cEotO,"%3.3s", cBuffer+4);
+		sprintf(cEotD,"%3.3s", cBuffer+7);
+		sprintf(datCham,"%4.4s%2.2s%2.2s",cBuffer+74,cBuffer+72,cBuffer+70);
+		sprintf(degrau,"%2.2s", cBuffer+98);
+		//sprintf(cn_b_ddd,"%2.2s", cBuffer+311);
+
+
+
+		sprintf(cGh,"%1.1s", cBuffer+97);
+		if( cBuffer[97] == '1' )
+		{
+			sprintf(cGh,"%1.1s", "N");
+		}
+		else if( (cBuffer[97] == '2') || (cBuffer[97] == '3'))
+		{
+			sprintf(cGh,"%1.1s", "R");
+		}
+		else if(cBuffer[97] == '4' )
+		{
+			sprintf(cGh,"%1.1s", "M");
+		}
+		else if(cBuffer[97] == '5' )
+		{
+			sprintf(cGh,"%1.1s", "D");
+		}
+		else
+		{
+			sprintf(cStrRascunho, "Erro. Grupo Horario diferente de 1, 2 , 3, 4 ou 5. valor: <%c>", cBuffer[97]);
+			gravaSoLog(fp_log_filho_erro, cStrRascunho);
+			exit(1);
+		}
+
+		// Formata o campo colocando ponto para fazer o calculo...
+		// mascaraCampoValor(cDuracaoTarifada, "9d", "9.d", cAuxDuracaoTarifada);
+
+
+		if(nTipoEmpresa == TLC)
+		{
+			// copia o nome da remessa do cdr para saber se eh pre-pago ou remessa comum
+			sprintf(cNomeOrig,"%35.35s",cBuffer+440);
+
+
+			// se for pre-pago
+			if( strstr(cNomeOrig,".S06") !=0 )
+			{
+				if(atoll(datCham) < 20150201) // se for chamdas anterior a 20150201, utiliza a regra abaixo de tarifacao
+				{
+					//Demanda 90045 - Nova regra de tarifacao do pre-pago. Para pre sempre vai olhar nas tabelas - Emerson - 2014-01-06
+					if(buscaTarifaTLCPRE(assB,cDataChamada, cValorTarifa, cEotO, cEotD, cGh))
+					{
+						sprintf(cStrRascunho, "Erro ao buscar a tarifa no banco <%s> usando a data <%s>\n", "connTarCdr", cDataChamada);
+						gravaSoLog(fp_log_filho_erro, cStrRascunho);
+						exit(1);
+					}
+
+				}
+				else // chamadas >= que 20150201
+				{
+					// CT-91731-Y0Y3 - se eot_a for Movel e degrau "02 e data da chamada  maior que 20150824, altera a tarifa para 2,99, senao continua 5,98
+		      itemHashEmpresa = (hashEmpresa_t*) ht_get(hashEmpresa, cEotO);
+   		    if ( (atoi(degrau) == 2) && (atoll(datCham) > 20150824) && itemHashEmpresa && (strncmp(itemHashEmpresa->cTipoEmp, "M", 1) == 0)  )
+					{
+						// para este cenario, a tarif passa a ser de 2.99
+						strcpy(cValorTarifa, "2.99");
+					}
+					else
+					{
+						// a partir de 01 de fevereiro de 2015, a tarifa do pre-pago passa a ser de R$ 5.98
+						strcpy(cValorTarifa, "5.98");
+					}
+				}
+
+
+				// calcula a duracao
+				sprintf(durReal,"%7.7s",cBuffer+84);
+				calculaDurTarifada(durReal, auxDur);
+        strcpy(cAuxDurTar,auxDur);
+
+				memcpy(cBuffer+91, auxDur, 6);
+				sprintf(cAuxDuracaoTarifada,"%5.5s.%1.1s",auxDur, auxDur+5);
+
+			}// fim pe-pago
+			else // pos-pago
+			{
+				if(atoll(datCham) < 20131101 )
+				{
+					// Formata o campo colocando ponto para fazer o calculo...
+					sprintf(cDuracaoTarifada,"%6.6s", cBuffer+91);
+					mascaraCampoValor(cDuracaoTarifada, "9d", "9.d", cAuxDuracaoTarifada);
+
+					// DMD 90012 - para alguns terminais assB especificos
+					// se a duracao for menor ou igual a 1.9 alteramos a duracao minima para 2.0
+					trim(assB);
+
+					// achou o assB na lista e nao eh pre-pago, entao aplica a promocao
+					if (strstr("6520650321;6520656569;6520656969;6520650800;6520650500;6520650555;6520650600;6520656565",assB)!=0)
+					{
+						if (atof(cAuxDuracaoTarifada) < 2.0) // se duracao for menor que 2.0, joga 2.0
+						{
+							strcpy(cAuxDuracaoTarifada,"0002.0");
+							memcpy(cBuffer+91, "000020", 6);
+              strcpy(cAuxDurTar ,"000020");
+						}
+
+					} // fim dmd 90012
+
+					// busca tarifa
+					if(buscaTarifaTLC(assB,cDataChamada, cValorTarifa, cEotO, cEotD, cGh))
+					{
+						sprintf(cStrRascunho, "Erro ao buscar a tarifa no banco <%s> usando a data <%s>\n", "connTarCdr", cDataChamada);
+						gravaSoLog(fp_log_filho_erro, cStrRascunho);
+						exit(1);
+					}
+
+				} // fim < 20131101
+				else if(atoll(datCham) < 20150701 )
+				{
+					// DMD 90218 05/02/2015 - passa a tarifar com 5.98 as chamadas deste terminal que sejam da T65 e entre 01/03/2015 a 31/12/2015
+ 		      itemHashEmpresa = (hashEmpresa_t*)ht_get(hashEmpresa, cEotD);
+		      if (itemHashEmpresa && (strncmp(itemHashEmpresa->sigla_holding, "T65", 3) == 0) && (strstr(assB, "6520656799") != 0) && (atoll(datCham) >= 20150301) && (atoll(datCham) <= 20151231) )
+					{
+						strcpy(cValorTarifa, "5.98");
+					}
+
+          else if (itemHashEmpresa && (strncmp(itemHashEmpresa->sigla_holding, "T65", 3) == 0) && (strstr(assB, "6520650") != 0 || strstr(assB, "6520656") != 0 ) )
+					{
+						// DMD 90045 - se eot_B for da T65 e assB for um numero da T65, entao tarifa eh 3,99
+						strcpy(cValorTarifa, "3.99");
+					}
+					else if(atoll(datCham) < 20140301 )// mantem a tarifa antiga de 6.00
+					{
+						strcpy(cValorTarifa, "6.00");
+					}
+					else // Dmd 90061 a partir de 20140301 passa a ter a tarifa de 1.99
+					{
+						strcpy(cValorTarifa, "1.99");
+					}
+
+
+					// calcula a duracao utilizando a tarifacao basica (minimo de 30 segundos)
+					sprintf(durReal,"%7.7s",cBuffer+84);
+					calculaDurTarifada(durReal, auxDur);
+          strcpy(cAuxDurTar,auxDur);
+
+					memcpy(cBuffer+91, auxDur, 6);
+					sprintf(cAuxDuracaoTarifada,"%5.5s.%1.1s",auxDur, auxDur+5);
+				}
+				else  // chamdas >= 20150701
+				{
+					// CT-91731-Y0Y3 - se eot_a for Movel e degrau "02 e data da chamada  maior que 20150824, altera a tarifa para 2,99, senao continua 5,98
+                    if ( (atoi(degrau) == 2) && (atoll(datCham) > 20150824) && itemHashEmpresa && (strncmp(itemHashEmpresa->cTipoEmp, "M", 1) == 0)  )
+					{
+						// para este cenario, a tarif passa a ser de 2,99
+						strcpy(cValorTarifa, "2.99");
+					}
+					else
+					{
+						// a partir de 01/07/2015 a tarifa passa a ser 5,98
+						strcpy(cValorTarifa, "5.98");
+					}
+  
+
+					// calcula a duracao utilizando a tarifacao basica (minimo de 30 segundos)
+					sprintf(durReal,"%7.7s",cBuffer+84);
+					calculaDurTarifada(durReal, auxDur);
+          strcpy(cAuxDurTar,auxDur);
+          
+
+					memcpy(cBuffer+91, auxDur, 6);
+					sprintf(cAuxDuracaoTarifada,"%5.5s.%1.1s",auxDur, auxDur+5);
+
+				}
+
+			} // fim pos-pago
+
+
+			// Preenche o campo valor liquido.
+			sprintf(cResultado,"%011.5f", (atof(cValorTarifa) * atof(cAuxDuracaoTarifada)) );
+			mascaraCampoValor(cResultado, "9.ddddd", "9ddddd", cValorLiquido);
+			memcpy(cBuffer+352, cValorLiquido, 10);
+
+			// soma o valor liquido para a tualizar a conversao
+			pthread_mutex_lock(&MutexVariavel);
+			seqRemessaVal[atoll(seq)] += atoll(cValorLiquido);
+      seqRemessaDurTar[atoll(seq)] += atoll(cAuxDurTar);
+			pthread_mutex_unlock(&MutexVariavel);
+		}
+		else if(nTipoEmpresa == VIP)
+		{
+      // 12/12/2016 calcula a duracao utilizando a tarifacao basica (minimo de 30 segundos)
+      sprintf(durReal,"%7.7s",cBuffer+84);
+      calculaDurTarifada(durReal, auxDur);
+      strcpy(cAuxDurTar,auxDur);
+      memcpy(cBuffer+91, auxDur, 6);
+      sprintf(cAuxDuracaoTarifada,"%5.5s.%1.1s",auxDur, auxDur+5);
+      
+       
+			// Preenche o campo valor liquido.
+			// tarifa fixa
+			strcpy(cValorTarifa, "3.99");
+			sprintf(cResultado,"%011.5f", (atof(cValorTarifa) * atof(cAuxDuracaoTarifada)) );
+
+			mascaraCampoValor(cResultado, "9.ddddd", "9ddddd", cValorLiquido);
+			memcpy(cBuffer+352, cValorLiquido, 10);
+			
+			// soma o valor liquido para a tualizar a conversao
+			pthread_mutex_lock(&MutexVariavel);
+			seqRemessaVal[atoll(seq)] += atoll(cValorLiquido);
+      seqRemessaDurTar[atoll(seq)] += atoll(cAuxDurTar);
+			pthread_mutex_unlock(&MutexVariavel);
+
+		}
+		else
+		{
+			printf("Erro ao determinar a empresa de execução: c65 ou c75, no momento do calculo do valor liquido.");
+			exit(1);
+		}
+
+		written = write(fileno(fp_arquivoSaida), cBuffer, strlen(cBuffer));
+		if (written <= 0)
+		{
+			printf("Erro na gravação - O Filesystem esta cheio ou o arquivo esta corrompido.\n");
+			sprintf(cStrRascunho, "Erro na gravação - O Filesystem esta cheio ou o arquivo esta corrompido.\n");
+			gravaSoLog(fp_log_filho_erro, cStrRascunho);
+			exit(1);
+		}
+
+	} // fim while
+
+
+	// Move o arquivo para a saida ...
+	sprintf(cStrRascunho, "mv %s %s/%s", cPathSaida, g_cEntrada, cNomeSaida);
+	executaChamada(cStrRascunho);
+
+	// apaga o arquivo de entrada...
+	if( unlink(cPathEntrada) != 0)
+	{
+		printf("Erro ao apagar o arquivo de entrada: [%s]\n", cPathEntrada);
+		sprintf(cStrRascunho, "Erro ao apagar o arquivo de entrada: [%s]\n", cPathEntrada);
+		gravaSoLog(fp_log_filho_erro, cStrRascunho);
+		exit(1);
+	}
+
+	// Bloqueia e desbloquei a variavel global
+	pthread_mutex_lock(&MutexVariavel);
+	flagThread[indice] = 2;
+	qtdeThreadsTerminadas++;
+	pthread_mutex_unlock(&MutexVariavel);
+
+	pthread_exit(NULL);
+	return ((void *) NULL);
+}
+
+
+int buscaTarifaTLC(char *assinanteB, char *cDataChamada, char *cValorTarifa, char *cEotO, char *cEotD, char *cGh)
+{
+  char dbTarifa[16 + 1];
+  char dtChamada[10 + 1];
+  char assiB[23 + 1];
+
+  char cTipoO[1 + 1];
+  char cTipoD[1 + 1];
+  char db_cGh[1 + 1];
+  hashEmpresa_t *itemHashEmpresa = NULL;
+
+  memset(dbTarifa, 0, sizeof(dbTarifa));
+
+  // bloqueia o banco ...
+  pthread_mutex_lock(&MutexVariavel);
+
+  logInDatabase(DATABASE);
+
+  strcpy(dtChamada, cDataChamada);
+  strcpy(assiB, assinanteB);
+  rtrim(assiB);
+
+  EXEC SQL select vlr_tarifa
+  INTO :dbTarifa
+  from t_tarifa_terminal
+  WHERE terminal = :assiB
+  AND tipo_tarifa = 'POS'
+  AND :dtChamada between dat_vigencia_ini and nvl(dat_vigencia_fim, sysdate);
+  if (sqlca.sqlcode < 0)
+  {
+    pthread_mutex_unlock(&MutexVariavel);
+    printf("\n ERRO:[%d] - No select da tabela t_tarifa_terminal.", sqlca.sqlcode);
+    return 1;
+  }
+
+  rtrim(dbTarifa);
+  strcpy(cValorTarifa, dbTarifa);
+
+  if (cValorTarifa[0] == '\0')
+  {
+    itemHashEmpresa = (hashEmpresa_t *) ht_get(hashEmpresa, cEotO);
+    if(itemHashEmpresa)
+      sprintf(cTipoO, "%1.1s", itemHashEmpresa->cTipoEmp);
+    
+    itemHashEmpresa = (hashEmpresa_t *) ht_get(hashEmpresa, cEotD);
+    if(itemHashEmpresa)
+      sprintf(cTipoD, "%1.1s", itemHashEmpresa->cTipoEmp);
+    
+    sprintf(db_cGh, "%1.1s", cGh);
+
+    if ( cTipoO[0] == '\0' )
+    {
+      pthread_mutex_unlock(&MutexVariavel);
+      printf("\n ERRO. Nao existe a eot de origem %s na tabela t_empresa.", cEotO);
+      return 1;
+    }
+
+    if ( cTipoD[0] == '\0' )
+    {
+      pthread_mutex_unlock(&MutexVariavel);
+      printf("\n ERRO. Nao existe a eot de destino %s na tabela t_empresa.", cEotD);
+      return 1;
+    }
+
+    EXEC SQL select vlr_tarifa
+    INTO :dbTarifa
+    from t_tarifa_trafego
+    WHERE tipo_trafego_assa = :cTipoO
+    AND tipo_trafego_assb = :cTipoD
+    AND tipo_horario = :db_cGh
+    AND tipo_tarifa = 'POS'
+    AND dat_vigencia_ini =
+    ( SELECT MAX(dat_vigencia_ini)
+                    FROM t_tarifa_trafego
+                    WHERE dat_vigencia_ini <= :dtChamada
+                    AND tipo_trafego_assa = :cTipoO
+                    AND tipo_trafego_assb = :cTipoD
+                    AND tipo_horario = :db_cGh
+                    AND tipo_tarifa = 'POS'
+                    );
+    if (sqlca.sqlcode < 0)
+    {
+      pthread_mutex_unlock(&MutexVariavel);
+      printf("\n ERRO:[%d] - No select da tabela t_tarifa_terminal.", sqlca.sqlcode);
+      return 1;
+    }
+  }
+
+  rtrim(dbTarifa);
+  strcpy(cValorTarifa, dbTarifa);
+
+  //logOutDatabase("connTarCdr");
+
+  // desbloqueia o banco ...
+  pthread_mutex_unlock(&MutexVariavel);
+
+
+  return 0;
+}
+
+
+int buscaTarifaTLCPRE(char *assinanteB, char *cDataChamada, char *cValorTarifa, char *cEotO, char *cEotD, char *cGh)
+{
+  char dbTarifa[16 + 1];
+  char dtChamada[10 + 1];
+  char assiB[23 + 1];
+
+  char cTipoO[1 + 1];
+  char cTipoD[1 + 1];
+  char db_cGh[1 + 1];
+
+  hashEmpresa_t *itemHashEmpresa = NULL;
+
+  memset(dbTarifa, 0, sizeof(dbTarifa));
+
+  // bloqueia o banco ...
+  pthread_mutex_lock(&MutexVariavel);
+
+  logInDatabase(DATABASE);
+
+  strcpy(dtChamada, cDataChamada);
+  strcpy(assiB, assinanteB);
+  rtrim(assiB);
+
+  EXEC SQL select vlr_tarifa
+  INTO :dbTarifa
+  from t_tarifa_terminal
+  WHERE terminal = :assiB
+  AND tipo_tarifa = 'PRE'
+  AND :dtChamada between dat_vigencia_ini and nvl(dat_vigencia_fim, sysdate);
+  if (sqlca.sqlcode < 0)
+  {
+    pthread_mutex_unlock(&MutexVariavel);
+    printf("\n ERRO:[%d] - No select da tabela t_tarifa_terminal.", sqlca.sqlcode);
+    return 1;
+  }
+
+  rtrim(dbTarifa);
+  strcpy(cValorTarifa, dbTarifa);
+
+  if (cValorTarifa[0] == '\0')
+  {
+    
+    itemHashEmpresa = (hashEmpresa_t *) ht_get(hashEmpresa, cEotO);
+    if(itemHashEmpresa)
+      sprintf(cTipoO, "%1.1s", itemHashEmpresa->cTipoEmp);
+
+    itemHashEmpresa = (hashEmpresa_t *) ht_get(hashEmpresa, cEotD);
+    if(itemHashEmpresa)
+      sprintf(cTipoD, "%1.1s", itemHashEmpresa->cTipoEmp);
+    sprintf(db_cGh, "%1.1s", cGh);
+
+    if ( cTipoO[0] == '\0' )
+    {
+      pthread_mutex_unlock(&MutexVariavel);
+      printf("\n ERRO. Nao existe a eot de origem %s na tabela t_empresa.", cEotO);
+      return 1;
+    }
+
+    if ( cTipoD[0] == '\0' )
+    {
+      pthread_mutex_unlock(&MutexVariavel);
+      printf("\n ERRO. Nao existe a eot de destino %s na tabela t_empresa.", cEotD);
+      return 1;
+    }
+
+    EXEC SQL select vlr_tarifa
+    INTO :dbTarifa
+    from t_tarifa_trafego
+    WHERE tipo_trafego_assa = :cTipoO
+    AND tipo_trafego_assb = :cTipoD
+    AND tipo_horario = :db_cGh
+    AND tipo_tarifa = 'PRE'
+    AND dat_vigencia_ini =
+    ( SELECT MAX(dat_vigencia_ini)
+                    FROM t_tarifa_trafego
+                    WHERE dat_vigencia_ini <= :dtChamada
+                    AND tipo_trafego_assa = :cTipoO
+                    AND tipo_trafego_assb = :cTipoD
+                    AND tipo_horario = :db_cGh
+                    AND tipo_tarifa = 'PRE');
+    if (sqlca.sqlcode < 0)
+    {
+      pthread_mutex_unlock(&MutexVariavel);
+      printf("\n ERRO:[%d] - No select da tabela t_tarifa_terminal.", sqlca.sqlcode);
+      return 1;
+    }
+  }
+
+  rtrim(dbTarifa);
+  strcpy(cValorTarifa, dbTarifa);
+
+  //logOutDatabase("connTarCdr");
+
+  // desbloqueia o banco ...
+  pthread_mutex_unlock(&MutexVariavel);
+
+
+  return 0;
+}
+
+
+
+// Busca no banco a parte fixa dos diretorios de Entrada e saida ( radical )...
+void buscaDiretorioExecucao()
+{
+  EXEC SQL SELECT dir_etc
+  INTO    :dbDirEtc
+  FROM    t_confdir;
+
+  rtrim(dbDirEtc);
+}
+
+
+// Valida se tem algum programa rodando que pode dar conflito com este ...
+int ValidaProgramas()
+{
+  char dataB[1024];
+  int dbCodSinal = 1;
+  int dbCount;
+
+  // recuperando a hora de inicio ...
+  sprintf(dataB, "%s%s", dataC, horaC);
+
+  // Conecta no Banco para fazer as validacoes ...
+  logInDatabase(DATABASE);
+
+  // valida se existe algum programa rodando ou abendado ...
+  EXEC SQL SELECT count(*)
+  INTO    :dbCount
+  FROM    t_semaforo_cob
+  WHERE nom_rotina in ('quebra_envio','batimento_envio','hpl_envio','headertot_env')
+  AND cod_sinal = 1;
+  if (sqlca.sqlcode < 0)
+  {
+    printf("\n 2-ERRO[%d] NO SELECT que valida as condicoes do semaforo ... ", sqlca.sqlcode);
+
+    // Desconecta no banco de dados
+    //logOutDatabase("connQ");
+    return 1;
+  }
+
+  // valida o retorno do select ...
+  if (dbCount > 0)
+  {
+    printf("\n O PROGRAMA NAO PODE SER EXECUTADO, CHECAR SE TEM ALGUM PROGRAMA RODANDO OU \"ABENDADO\".\n");
+
+    // Desconecta no banco de dados
+    //logOutDatabase("connQ");
+    return 1;
+  }
+
+  // valida se existe o quebra na tabela e qual e o status ...
+  EXEC SQL SELECT cod_sinal,count(*)
+  INTO    :dbCodSinal,:dbCount
+  FROM    t_semaforo_cob
+  WHERE nom_rotina = 'tarifa_cdr_envio'
+  group by cod_sinal;
+  if (sqlca.sqlcode < 0)
+  {
+    printf("\n 3-ERRO[%d] NO SELECT que valida as condicoes do semaforo ... ", sqlca.sqlcode);
+
+    // Desconecta no banco de dados
+    //logOutDatabase("connQ");
+    return 1;
+  }
+
+  // valida o retorno do select ...
+  if (dbCount == 0)
+  {
+    // nao existe linha para o quebra ( primeira vez que esta rodando ) ...
+    EXEC SQL INSERT into t_semaforo_cob (nom_rotina,dat_ini,cod_sinal)
+    VALUES ('tarifa_cdr_envio',:dataB,1);
+    if (sqlca.sqlcode < 0)
+    {
+      printf("\n ERRO[%d] NO INSERT do semaforo ... ", sqlca.sqlcode);
+
+      // Desconecta no banco de dados
+      //logOutDatabase("connQ");
+      return 1;
+    }
+
+    EXEC SQL COMMIT;
+    if (sqlca.sqlcode < 0)
+    {
+      printf("\n ERRO[%d] NO COMMIT INSERT do semaforo ... ", sqlca.sqlcode);
+      return 1;
+    }
+
+  }
+  else
+  {
+    if (dbCodSinal == 1)
+    {
+      printf("\n O PROGRAMA NAO PODE SER EXECUTADO, CHECAR SE TEM ALGUM TARIFA_CDR RODANDO OU \"ABENDADO\".\n");
+
+      // Desconecta no banco de dados
+      //logOutDatabase("connQ");
+      return 1;
+    }
+    else
+    {
+      // valida se a quebra esta rodando apos os outros programas estarem ok ...
+      EXEC SQL SELECT count(*)
+      INTO    :dbCount
+      FROM    t_semaforo_cob
+      WHERE nom_rotina in ('batimento_envio','hpl_envio','headertot_env')
+      AND cod_sinal = 0;
+      if (sqlca.sqlcode < 0)
+      {
+        printf("\n 4-ERRO[%d] NO SELECT que valida as condicoes do semaforo ... ", sqlca.sqlcode);
+
+        // Desconecta no banco de dados
+        //logOutDatabase("connQ");
+        return 1;
+      }
+
+      // valida o retorno do select ...
+      if (dbCount != 3)
+      {
+        printf("\n O PROGRAMA NAO PODE SER EXECUTADO, CHECAR SE TEM ALGUM PROGRAMA RODANDO OU \"ABENDADO\".\n");
+
+        // Desconecta no banco de dados
+        //logOutDatabase("connQ");
+        return 1;
+      }
+    }
+
+    // faz o update para status rodando ...
+    EXEC SQL UPDATE t_semaforo_cob
+    SET cod_sinal =1,
+    dat_ini =:dataB ,
+    dat_fim = NULL
+    where nom_rotina = 'tarifa_cdr_envio';
+    if (sqlca.sqlcode < 0)
+    {
+      printf("\n ERRO AO ATUALIZAR O STATUS DA TABELA T_SEMAFORO_COB PARA RODANDO(1) - [%d].", sqlca.sqlcode);
+      //logOutDatabase("connQ");
+      return 1;
+    }
+    EXEC SQL COMMIT;
+    if (sqlca.sqlcode < 0)
+    {
+      printf("\n ERRO[%d] NO COMMIT ATUALIZAR O STATUS DA TABELA T_SEMAFORO_COB PARA RODANDO(1) ", sqlca.sqlcode);
+      return 1;
+    }
+
+  }
+
+  // Desconecta no banco de dados
+  //logOutDatabase("connQ");
+
+  // Tudo Ok ...
+  return 0;
+}
+
+// Funcao responsavel por atualizar o "Status" do semaforo para "0" ...
+int finalizaSemaforo()
+{
+  char dataB[1024];
+  char horC[8 + 1];
+  char dtC[11 + 1];
+
+  // recebe a data e a hora corrente para as threads utilizarem ...
+  hoje(dtC);
+  agora(horC);
+
+  // recuperando a hora de inicio ...
+  sprintf(dataB, "%s%s", dtC, horC);
+
+  // Conecta no Banco para fazer as validacoes ...
+  logInDatabase(DATABASE);
+
+  EXEC SQL UPDATE t_semaforo_cob
+  SET cod_sinal =0,
+  dat_fim =:dataB
+  where nom_rotina = 'tarifa_cdr_envio';
+  if (sqlca.sqlcode < 0)
+  {
+    gravaSoLog(fp_log_filho_erro, "ERRO AO ATUALIZAR O STATUS DA TABELA T_SEMAFORO_COB PARA OK (0).");
+    //logOutDatabase("connQ");
+    exit(1);
+  }
+
+  EXEC SQL COMMIT;
+  if (sqlca.sqlcode < 0)
+  {
+    printf("\n ERRO[%d] NO COMMIT ATUALIZAR O STATUS DA TABELA T_SEMAFORO_COB PARA OK (0)", sqlca.sqlcode);
+    return 1;
+  }
+
+  //logOutDatabase("connQ");
+  return 0;
+}
+
+
+
+// busca as pessoas que irao receber o email informativo ...
+void buscaListaEmail()
+{
+  EXEC SQL SELECT lista_email, nom_banco
+  INTO :listaEmail, :bancoxx
+  FROM t_parametros;
+  if (sqlca.sqlcode < 0)
+  {
+    printf("\n Erro[%d] ao buscar a lista de email na tabela t_parametros ... ", sqlca.sqlcode);
+    exit(1);
+  }
+
+  rtrim(listaEmail);
+  rtrim(bancoxx);
+}
+
+
+
+// ********************* FUNCOES DO BANCO DE DADOS ***********************
+// conecta no Banco de Dados
+void logInDatabase(char *banco)
+{
+  char msg[100];
+  sprintf(dbNomeBanco, "%s", banco);
+  EXEC SQL connect :dbNomeBanco;
+  sprintf(msg, "ERRO AO CONECTAR NO BANCO %s", dbNomeBanco);
+  escreveSQLErro(sqlca, msg);
+
+  EXEC SQL ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS';
+  sprintf(msg, "ALTER SESSION SET NLS_DATE_FORMAT");
+  escreveSQLErro(sqlca, msg);
+
+}
+
+//Desconecta do Banco de Dados
+//void //logOutDatabase(char *conexao)
+//{
+//      EXEC SQL BEGIN DECLARE SECTION ;
+//      char dbConexao[15];
+//      EXEC SQL END DECLARE SECTION ;
+//      sprintf(dbConexao,"%s",conexao);
+//      EXEC SQL DISCONNECT :dbConexao;
+//      //EXEC SQL DISCONNECT current;
+//      escreveSQLErro(sqlca,SQLCODE,sqlca.sqlerrd[1],"in disconnecting from database"," ");
+//}
+
+// conecta no Banco de Dados por thread ...
+void logInDatabase1(char *conexao, char *banco1)
+{
+  EXEC SQL BEGIN DECLARE SECTION ;
+    char dbConexao1[15 + 1];
+    char dbNomeBanco1[100];
+  EXEC SQL END DECLARE SECTION ;
+  char msg[51];
+  sprintf(dbNomeBanco1, "%s", banco1);
+  sprintf(dbConexao1, "%s", conexao);
+  EXEC SQL connect :dbNomeBanco1;
+  sprintf(msg, "ao conectar no Banco [%s] com a conexao [%s]", banco1, dbConexao1);
+  escreveSQLErro(sqlca, msg);
+  EXEC SQL ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS';
+}
+
+
+// Escreve MSG de ERROS ...
+int escreveSQLErro(struct sqlca sqlca, char *msg)
+{
+  int ret = 1;
+  if (sqlca.sqlcode < 0)
+  {
+    sqlca.sqlerrm.sqlerrmc[sqlca.sqlerrm.sqlerrml] = 0;
+    printf("%s - SQLCODE: %d - %s\n\n", msg, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+    EXEC SQL ROLLBACK;
+    exit(1);
+  }
+  return (ret);
+} // escreveSQLErro
+
+// **************** Funcoes do MUTEX **************************
+// Inicializa o Mutex ( ou semaforo para thread) ...
+void inicializaMutex(pthread_mutex_t Mutex)
+{
+  int rc;
+  rc = pthread_mutex_init(&Mutex, NULL);
+  if (rc != 0)
+  {
+    printf("Erro ao inicializar o Mutex.");
+    exit(1);
+  }
+}
+
+// Destroi o Mutex ( ou semaforo para thread) ...
+void destroiMutex(pthread_mutex_t Mutex)
+{
+  int rc;
+  rc = pthread_mutex_destroy(&Mutex);
+  if (rc != 0)
+  {
+    printf("\n Erro ao destruir o Mutex.");
+    exit(1);
+  }
+}
+
+// **********
+// FUNCOES AUXILIARES ...
+char *agora(char *HHMMSS)
+{
+  static time_t ltnow;
+  struct tm *hnow;
+  ltnow = time(0);
+  hnow = (struct tm*)localtime(&ltnow);
+  sprintf(HHMMSS, "%02d:%02d:%02d", hnow->tm_hour, hnow->tm_min, hnow->tm_sec);
+  return HHMMSS;
+} // Agora
+
+// **********
+// FUNCOES AUXILIARES ...
+char *agora1(char *HHMMSS)
+{
+  static time_t ltnow;
+  struct tm *hnow;
+  ltnow = time(0);
+  hnow = (struct tm*)localtime(&ltnow);
+  sprintf(HHMMSS, "%02d%02d%02d", hnow->tm_hour, hnow->tm_min, hnow->tm_sec);
+  return HHMMSS;
+} // Agora
+
+
+//Funcao para capturar a data atual do sistema
+char *hoje(char *AAAAMMDD)
+{
+  struct tm *hnow;
+  time_t ltnow = time(0);
+  hnow = (struct tm*)localtime(&ltnow);
+  sprintf(AAAAMMDD, "%04d-%02d-%02d ", hnow->tm_year + 1900, hnow->tm_mon + 1, hnow->tm_mday);
+  return AAAAMMDD;
+}
+
+//Funcao para capturar a data atual do sistema
+char *hoje1(char *AAAAMMDD)
+{
+  struct tm *hnow;
+  time_t ltnow = time(0);
+  hnow = (struct tm*)localtime(&ltnow);
+  sprintf(AAAAMMDD, "%04d%02d%02d", hnow->tm_year + 1900, hnow->tm_mon + 1, hnow->tm_mday);
+  return AAAAMMDD;
+}
+
+/*******************************************************************************************
+ * @executaChamada
+ * Descrição: Executa uma chamada de linha de comando com os parâmetros informados.
+ *******************************************************************************************/
+int executaChamada(const char * strComando)
+{
+  int retorno = system(strComando);
+  if (retorno && (errno == ECHILD))
+    return 0;
+
+  return retorno;
+}
+
+/**************************************************************************************************
+ *@inverteString - inverte a string fornecida
+ ***************************************************************************************************/
+void inverteString(char *par_str)
+{
+
+  int j = 0;
+  int i;
+  char *pszInvString;
+
+  pszInvString = strdup(par_str);
+  memset(pszInvString, 0, strlen(pszInvString));
+
+  for (i = strlen(par_str) - 1; i >= 0; i--)
+    (pszInvString[j++]) = par_str[i];
+  strcpy(par_str, pszInvString);
+  free(pszInvString);
+}
+
+/*******************************************************************************************
+ * @mascaraCampoValor
+ * formatos possiveis
+ *
+ * 9
+ * 9d       9dd           9ddd          9dddd         9ddddd
+ * 9,d      9,dd          9,ddd         9,dddd        9,ddddd
+ * 9.d      9.dd          9.ddd         9.dddd        9.ddddd
+ *
+ * Parametros: par_valor - valor de entrada, a ser convertido
+ *             par_mascaraValor - mascara do valor de entrada
+ *             par_mascaraSaida - mascara do valor de saida
+ *             par_retorno - valor convertido retornado
+ *
+ * Obs. os campos a esquerda apesar de possuirem apenas um caracter podem ter varias posicoes
+ *
+ *******************************************************************************************/
+int mascaraCampoValor(char *par_valor, char *par_mascaraValor, char *par_mascaraSaida, char *par_retorno)
+{
+  int i = 0;
+  int j = 0;
+  int k = 0;
+  char szCaracteristica[BUFSIZ + 1];
+  char szMantissa[BUFSIZ + 1];
+  char szAux[BUFSIZ + 1];
+  char szMascaraValorEntrada[BUFSIZ + 1];
+  char cSeparador;
+
+  int iCaracEntrada = 0;
+  int iMantissaEntrada = 0;
+  int iCaracSaida = 0;
+  int iMantissaSaida = 0;
+  int iPosSeparador = 0;
+
+  memset(szCaracteristica, 0, sizeof(szCaracteristica));
+  memset(szMantissa, 0, sizeof(szMantissa));
+  memset(par_retorno, 0, sizeof(par_retorno));
+  memset(szAux, 0, sizeof(szAux));
+  memset(szMascaraValorEntrada, 0, sizeof(szMascaraValorEntrada));
+
+  // testa mascara valida
+  if ((j = strlen(par_mascaraValor) - 1) == -1)
+    return 1;
+
+  // converte mascara para minuscula
+  for (k = 0; k < strlen(par_mascaraValor); k++)
+    szMascaraValorEntrada[k] = tolower(par_mascaraValor[k]);
+
+  for (i = strlen(par_valor) - 1 ; i >= 0; i--)
+  {
+    if (szMascaraValorEntrada[j] == '9')
+      szCaracteristica[iCaracEntrada++] = par_valor[i];
+
+    else if (szMascaraValorEntrada[j] == 'd')
+      szMantissa[iMantissaEntrada++] = par_valor[i];
+
+    else if (szMascaraValorEntrada[j] == ',' || szMascaraValorEntrada[j] == '.')
+      iPosSeparador = j;
+    else
+      return 1;
+
+    if (--j == -1)
+      j = 0;
+  }
+  inverteString(szCaracteristica);
+  inverteString(szMantissa);
+
+  iMantissaSaida = 0;
+  iCaracSaida = 0;
+  iPosSeparador = 0;
+
+  for (i = 0; i < strlen(par_mascaraSaida); i++)
+  {
+    if (par_mascaraSaida[i] == '9' )
+      iCaracSaida++;
+    else if (par_mascaraSaida[i] == 'd' || par_mascaraSaida[i] == 'D')
+      iMantissaSaida++;
+    else if (par_mascaraSaida[i] == ',' || par_mascaraSaida[i] == '.')
+    {
+      iPosSeparador = i;
+      cSeparador = par_mascaraSaida[i];
+    }
+  }
+
+
+  memset(       szAux, '0', sizeof(szAux));
+  szAux[sizeof(szAux) - 1] = '\0';
+
+  if (szMantissa[0] != 0)
+    strncpy(szAux,     szMantissa, iMantissaEntrada);
+  szAux[iMantissaSaida] = '\0';
+
+
+  if (iPosSeparador == 0)
+  {
+    if (iMantissaSaida > 0)
+      sprintf(par_retorno, "%s%s", szCaracteristica, szAux);
+    else
+      sprintf(par_retorno, "%s", szCaracteristica);
+  }
+  else
+    sprintf(par_retorno, "%s%c%s", szCaracteristica, cSeparador, szAux);
+
+
+  return 0;
+
+}
+
+
+int dirName (char *dir, char *arqIn)
+{
+  int x = 0, i = 0;
+  char *aux;
+
+  memset(dir, 0, (int) strlen(dir) + 1);
+
+  aux = (char *) calloc(strlen(arqIn), sizeof(char));
+  for (x = 0; arqIn[x] != '\0' && arqIn[x] != '\n'; x++)
+  {
+    if (arqIn[x] == '/')
+    {
+      i = 0;
+      strcat(dir, aux);
+      memset(aux, 0, strlen(aux) + 1);
+    }
+    aux[i++] = arqIn[x];
+  }
+  dir[strlen(dir)] = '\0';
+  return (0);
+}
+
+
+void calculaDurTarifada( char *durReal, char *durTar)
+{
+  char cHora[3 + 1];
+  char cMinuto[2 + 1];
+  char cSegundos[2 + 1];
+
+  int nResto = 0;
+  long int nTotalSegundos = 0;
+  float nHora = 0;
+  float nMinuto = 0;
+  float nSegundos = 0;
+  char par_duracao[10 + 1];
+
+  memset(par_duracao, sizeof(par_duracao), 0);
+
+
+  // · total de segundos = (HHH * 3600) + (MM * 60) + SS.
+  sprintf(cHora, "%3.3s", durReal);
+  sprintf(cMinuto, "%2.2s", durReal + 3);
+  sprintf(cSegundos, "%2.2s", durReal + 5);
+  nTotalSegundos = ((atoi(cHora) * 3600) + (atoi(cMinuto) * 60) + atoi(cSegundos));
+
+
+  // atualizar o valor do total de segundos para o minimo de 30 segundos.
+  if (nTotalSegundos <= 30)
+    nTotalSegundos = 30;
+
+  // · Se o valor do total de segundos não for múltiplo de 6, o sistema deve arredondar o valor para o próximo múltiplo de 6 válido;
+  if ((nResto = (nTotalSegundos % 6)) != 0)
+    nTotalSegundos += (6 - nResto);
+
+  // · Esta duração deve ser calculada no formato décimo de minuto ( o separador deve ser vírgula). Para transformar em décimo de minuto,
+  nHora = (nTotalSegundos / 60) / 60;
+  nMinuto = (nTotalSegundos - (nHora * 60 * 60)) / 60;
+  nSegundos = (nTotalSegundos - (nHora * 60 * 60) - (nMinuto * 60));
+
+  // · Esta duração deve ser calculada no formato décimo de minuto ( o separador deve ser vírgula). Para transformar em décimo de minuto,
+  // aplicar a fórmula: (HH*60) + (MM) + (SS/60).
+  sprintf(par_duracao, "%06.1f", (nHora * 60) + nMinuto + (nSegundos / 60));
+  retiraCaractere(par_duracao, '.', par_duracao);
+  sprintf(durTar, "%06d", atoi(par_duracao));
+}
+
+void calculaDurTarifadaDestFixo( char *durReal, char *durTar)
+{
+	char cHora[3+1];
+	char cMinuto[2+1];
+	char cSegundos[2+1];
+
+	int nResto = 0;
+	long int nTotalSegundos=0;
+	float nHora = 0;
+	float nMinuto = 0;
+	float nSegundos = 0;
+	char par_duracao[10+1];
+
+	memset(par_duracao,sizeof(par_duracao),0);
+
+
+	// · total de segundos = (HHH * 3600) + (MM * 60) + SS.
+	sprintf(cHora, "%3.3s", durReal);
+	sprintf(cMinuto, "%2.2s", durReal+3);
+	sprintf(cSegundos, "%2.2s", durReal+5);
+	nTotalSegundos = ((atoi(cHora) * 3600) + (atoi(cMinuto) * 60) + atoi(cSegundos));
+ 
+ 
+	// atualizar o valor do total de segundos para o minimo de 30 segundos.
+	if(nTotalSegundos <= 60)
+		nTotalSegundos = 60;
+
+	// · Se o valor do total de segundos não for múltiplo de 30, o sistema deve arredondar o valor para o próximo múltiplo de 30 válido;
+	if((nResto = (nTotalSegundos % 30)) != 0)
+		nTotalSegundos += (30-nResto);
+
+	// · Esta duração deve ser calculada no formato décimo de minuto ( o separador deve ser vírgula). Para transformar em décimo de minuto,
+	nHora = (nTotalSegundos/60) / 60;
+	nMinuto = (nTotalSegundos - (nHora * 60 * 60)) / 60;
+	nSegundos = (nTotalSegundos - (nHora * 60 * 60) - (nMinuto * 60));
+
+	// · Esta duração deve ser calculada no formato décimo de minuto ( o separador deve ser vírgula). Para transformar em décimo de minuto,
+	// aplicar a fórmula: (HH*60) + (MM) + (SS/60).
+	sprintf(par_duracao, "%06.1f", (nHora*60) + nMinuto + (nSegundos/60));
+	retiraCaractere(par_duracao, '.', par_duracao);
+	sprintf(durTar, "%06d", atoi(par_duracao));
+}
+
+
+void retiraCaractere(const char *par_strBufferEntrada, const char par_cCaractere, char *par_strBufferSaida)
+{
+  const char *q;
+  char *p, *r;
+  int rem;
+  int iTamEnt;
+  const char *iUltimo;
+
+  for (q = par_strBufferEntrada, p = par_strBufferSaida, r = par_strBufferSaida,
+       rem = 0, iTamEnt = strlen(par_strBufferEntrada), iUltimo = par_strBufferEntrada + iTamEnt - sizeof(char);
+       (p = memccpy(p, q, par_cCaractere, iUltimo - q + 1));
+       q += (p - r), r = --p, rem++
+      );
+
+  par_strBufferSaida[iTamEnt - rem] = '\0';
+}
+
+int atualizaConvCarga()
+{
+  double aux = 0;
+  double vlr = 0;
+  double dur = 0;
+  long seq = 0;
+
+  for (seq = 0; seq < 6999999; seq++)
+  {
+    // so atualiza para as remessa que tem valor
+    if (seqRemessaVal[seq])
+    {
+      aux = seqRemessaVal[seq];
+      vlr = aux / 100000;
+      aux = seqRemessaDurTar[seq];
+      dur = aux / 10;
+      
+
+      EXEC SQL update t_conv_carga set val_conversao = :vlr, dur_conversao = :dur
+               where seq_conv_carga in(select seq_conv_carga from t_remessareg where num_seqremessa = :seq);
+      if (sqlca.sqlcode < 0)
+      {
+        printf("\n ERRO:[%d] - No update da tabela t_conv_carga.", sqlca.sqlcode);
+        return 1;
+      }
+      
+      EXEC SQL COMMIT;
+      if (sqlca.sqlcode < 0)
+      {
+        printf("\n ERRO:[%d] - No commit da tabela t_conv_carga.", sqlca.sqlcode);
+        return 1;
+      }
+    }
+
+  } // fim for
+
+
+  return 0;
+}

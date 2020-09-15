@@ -1,0 +1,3 @@
+comp_ora tarifaCdr.pc tarifaCdr
+cp tarifaCdr /1d/cob*/c31/app/bin
+

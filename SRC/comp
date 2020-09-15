@@ -1,0 +1,16 @@
+gcc -m64 -Wall \
+    -I../INCLUDE \
+    -c \
+    -g \
+    gerais.c 
+esql -m64 -Wall -lz \
+    -I../INCLUDE \
+    -g \
+    -lm \
+    -o \
+    tarifaCdr \
+    gerais.o \
+    tarifaCdr.ec \
+    -lpthread \
+    -D_REENTRANT \
+    -D_LARGEFILE64_SOURCE   
